@@ -141,6 +141,20 @@ namespace Gurux.DLMS.AMI.Messages.DB
             get;
             set;
         }
+
+        /// <summary>
+        /// The scheduler instance that claimed this task generation.
+        /// Used as a distributed lock to prevent duplicate task creation
+        /// when multiple API instances run concurrently.
+        /// Null means the task was created by a Reader or external caller.
+        /// </summary>
+        [DataMember]
+        [Description("Scheduler instance ID that claimed this schedule tick.")]
+        public string SchedulerInstanceId
+        {
+            get;
+            set;
+        }
     }
 
 }

@@ -288,5 +288,52 @@ namespace DBService.Controllers
             host.SetChange(TargetType.Schedule, DateTime.Now);
             return new DeleteScheduleTargetResponse();
         }
+
+        /// <summary>
+        /// Atomically claim a scheduler tick for a given schedule.
+        /// Only the first API instance to call this for a (ScheduleId, TickMinute) pair
+        /// will receive Claimed=true and should proceed to create tasks.
+        /// All other concurrent instances receive Claimed=false and must skip that tick.
+        /// This prevents duplicate task generation when multiple API nodes run in parallel.
+        /// </summary>
+        [HttpPost("ClaimScheduleTick")]
+        public ActionResult<ClaimScheduleTickResponse> Post(ClaimScheduleTickRequest request)
+        {
+            if (request.ScheduleId == 0)
+                return BadRequest("ScheduleId is required.");
+            if (string.IsNullOrEmpty(request.InstanceId))
+                return BadRequest("InstanceId is required.");
+
+            lock (host)
+            {
+                // Check if any instance already claimed this (ScheduleId, TickMinute) pair.
+                GXSelectArgs arg = GXSelectArgs.Select<GXSchedulerTick>(
+                    c => c.Id,
+                    q => q.ScheduleId == request.ScheduleId && q.TickMinute == request.TickMinute);
+                GXSchedulerTick existing = host.Connection.SingleOrDefault<GXSchedulerTick>(arg);
+
+                if (existing != null)
+                {
+                    // Already claimed by another instance.
+                    return new ClaimScheduleTickResponse { Claimed = false };
+                }
+
+                // No claim yet — insert our claim record. First writer wins.
+                host.Connection.Insert(GXInsertArgs.Insert(new GXSchedulerTick
+                {
+                    ScheduleId = request.ScheduleId,
+                    TickMinute = request.TickMinute,
+                    InstanceId = request.InstanceId,
+                    ClaimedAt = DateTime.Now
+                }));
+
+                // Prune old tick records older than 10 minutes to keep the table small.
+                DateTime pruneThreshold = DateTime.Now.AddMinutes(-10);
+                host.Connection.Delete(GXDeleteArgs.Delete<GXSchedulerTick>(
+                    q => q.ClaimedAt < pruneThreshold));
+
+                return new ClaimScheduleTickResponse { Claimed = true };
+            }
+        }
     }
 }
