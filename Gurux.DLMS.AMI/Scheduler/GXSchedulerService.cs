@@ -48,6 +48,15 @@ namespace Gurux.DLMS.AMI.Scheduler
         private readonly ILogger _logger;
         private Timer _timer;
 
+        /// <summary>
+        /// Unique ID for this scheduler instance.
+        /// Used as a distributed lock token: only the instance that successfully
+        /// writes its ID to GXTask.SchedulerInstanceId will create tasks for
+        /// that schedule tick, preventing duplicate execution across multiple
+        /// API nodes running concurrently.
+        /// </summary>
+        private readonly string _instanceId = Guid.NewGuid().ToString();
+
         public GXSchedulerService(ILogger<GXSchedulerService> logger)
         {
             _logger = logger;
@@ -55,7 +64,7 @@ namespace Gurux.DLMS.AMI.Scheduler
 
         public Task StartAsync(CancellationToken cancellationToken)
         {
-            _logger.LogInformation("Timed Background Service is starting.");
+            _logger.LogInformation("Timed Background Service is starting. InstanceId={InstanceId}", _instanceId);
             TimeSpan start = DateTime.Now.AddSeconds(60 - DateTime.Now.Second) - DateTime.Now;
             _timer = new Timer(DoWork, null, start, TimeSpan.FromMinutes(1));
             return Task.CompletedTask;
@@ -63,16 +72,20 @@ namespace Gurux.DLMS.AMI.Scheduler
 
         private async void DoWork(object state)
         {
-            _logger.LogWarning("Timed Background Service is working.");
+            _logger.LogWarning("Timed Background Service is working. InstanceId={InstanceId}", _instanceId);
             try
             {
                 DateTime now = DateTime.Now;
+                // Truncate to the current minute so all instances compare the same tick key.
+                DateTime tickMinute = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0);
+
                 ListSchedulesResponse list = null;
                 using (System.Net.Http.HttpResponseMessage response = await Helpers.client.PostAsJsonAsync(Startup.ServerAddress + "/api/schedule/ListSchedules", new ListSchedules()))
                 {
                     Helpers.CheckStatus(response);
                     list = await response.Content.ReadAsAsync<ListSchedulesResponse>();
                 }
+
                 List<GXTask> tasks = new List<GXTask>();
                 foreach (GXSchedule it in list.Schedules)
                 {
@@ -84,6 +97,36 @@ namespace Gurux.DLMS.AMI.Scheduler
                     if (Equals(dt, now))
                     {
                         _logger.LogTrace("+");
+
+                        // --- Distributed lock: claim this schedule tick via the API. ---
+                        // The server performs an atomic conditional update:
+                        //   UPDATE GXTask SET SchedulerInstanceId = @instanceId
+                        //   WHERE ScheduleId = @id AND TickMinute = @tick
+                        //     AND SchedulerInstanceId IS NULL
+                        // Only the first instance to call this wins; others get false back.
+                        ClaimScheduleTickRequest claimReq = new ClaimScheduleTickRequest
+                        {
+                            ScheduleId = it.Id,
+                            TickMinute = tickMinute,
+                            InstanceId = _instanceId
+                        };
+                        ClaimScheduleTickResponse claimResp = null;
+                        using (System.Net.Http.HttpResponseMessage response = await Helpers.client.PostAsJsonAsync(
+                            Startup.ServerAddress + "/api/schedule/ClaimScheduleTick", claimReq))
+                        {
+                            Helpers.CheckStatus(response);
+                            claimResp = await response.Content.ReadAsAsync<ClaimScheduleTickResponse>();
+                        }
+
+                        if (!claimResp.Claimed)
+                        {
+                            // Another instance already claimed this tick — skip to avoid duplicates.
+                            _logger.LogInformation(
+                                "Schedule {ScheduleId} tick {Tick} already claimed by another instance. Skipping.",
+                                it.Id, tickMinute);
+                            continue;
+                        }
+
                         foreach (GXObject obj in it.Objects)
                         {
                             foreach (GXAttribute a in obj.Attributes)
@@ -92,7 +135,8 @@ namespace Gurux.DLMS.AMI.Scheduler
                                 {
                                     Object = obj,
                                     TaskType = TaskType.Read,
-                                    Index = a.Index
+                                    Index = a.Index,
+                                    SchedulerInstanceId = _instanceId
                                 };
                                 tasks.Add(t);
                             }
@@ -112,8 +156,8 @@ namespace Gurux.DLMS.AMI.Scheduler
                         Console.WriteLine(dt.ToFormatString());
                         Console.WriteLine(now.ToString());
                     }
-
                 }
+
                 if (tasks.Count != 0)
                 {
                     AddTask at = new AddTask();
@@ -129,6 +173,7 @@ namespace Gurux.DLMS.AMI.Scheduler
                 _logger.LogInformation(ex.Message);
             }
         }
+
         bool Equals(GXDateTime t, DateTime t2)
         {
             if ((t.Skip & Enums.DateTimeSkips.Minute) == 0 &&

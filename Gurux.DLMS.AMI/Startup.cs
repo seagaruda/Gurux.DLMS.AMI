@@ -164,6 +164,7 @@ namespace Gurux.DLMS.AMI
                     h.Connection.CreateTable<GXSchedule>(false, false);
                     h.Connection.CreateTable<GXScheduleToAttribute>(false, false);
                     h.Connection.CreateTable<GXSchedulerInfo>(false, false);
+                    h.Connection.CreateTable<GXSchedulerTick>(false, false);
                     h.Connection.CreateTable<GXReaderInfo>(false, false);
                     h.Connection.CreateTable<GXDeviceToReader>(false, false);
                     h.Connection.CreateTable<GXDeviceLog>(false, false);
